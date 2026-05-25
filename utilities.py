@@ -26,12 +26,14 @@ import pyarrow.parquet as pq
 import requests
 from pandera.errors import SchemaError, SchemaErrors
 from requests.adapters import HTTPAdapter
+from tqdm import tqdm
 from urllib3 import Retry
 
 MAX_CPU: int = psutil.cpu_count(logical=False) or 1
 START_TIME: datetime = datetime.now()
 KENPOM_API: str = os.environ.get("KENPOM_API", os.environ.get("KENPOM_API_KEY", ""))
 T = TypeVar("T")
+R = TypeVar("R")
 
 
 class DownloadPassConfig(Protocol):
@@ -236,7 +238,7 @@ def parallelize_df(
 ) -> pd.DataFrame:
     """parallelize dataframe construction"""
     dataset: list[pd.DataFrame] = [
-        x for x in parallelize(func, array, max_cpu) if not x.empty
+        x for x in parallelize(func, array, max_cpu, desc="parallel df") if not x.empty
     ]
     return (
         pd.concat(dataset, axis=axis, ignore_index=(axis == 0))
@@ -249,15 +251,44 @@ def parallelize(
     func: Callable[[Any], T],
     array: Sequence[Any],
     max_cpu: int = MAX_CPU,
+    desc: str = "parallel",
 ) -> list[T]:
     """parallelize a function over an array"""
     if not array:
         return []
     num_procs: int = min(max_cpu, len(array))
     if num_procs <= 1:
-        return [func(array[0])]
+        return [func(item) for item in tqdm(array, total=len(array), desc=desc)]
     with Pool(processes=num_procs) as pool:
-        return list(pool.imap_unordered(func, array))
+        return list(
+            tqdm(
+                pool.imap_unordered(func, array),
+                total=len(array),
+                desc=desc,
+            )
+        )
+
+
+def parallelize_threads(
+    func: Callable[[T], R],
+    array: Sequence[T],
+    max_workers: int = MAX_CPU,
+    desc: str = "parallel",
+) -> list[R]:
+    """parallelize an io-bound function over an array"""
+    if not array:
+        return []
+    worker_count: int = min(max_workers, len(array))
+    if worker_count <= 1:
+        return [func(item) for item in tqdm(array, total=len(array), desc=desc)]
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(
+            tqdm(
+                executor.map(func, array),
+                total=len(array),
+                desc=desc,
+            )
+        )
 
 
 def get_seed() -> int:

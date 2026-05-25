@@ -14,6 +14,8 @@
 - Prefer standard Python and pandas over custom helper abstractions when the standard approach is clear.
 - Honor pylint limits for method line count and parameter count.
 - Use dataclasses for repeated structured config, inputs, and return shapes.
+- Minimize defensive coding; prefer failing fast over silently masking unexpected internal states.
+- Avoid redundant casting when a value is already typed, such as `y = int(x)` inside `def method(x: int)`.
 - Do not wrap basic Python or pandas operations in trivial helpers just to rename them.
 - Use small shared constants for repeated keys when they define a shared contract or improve consistency.
 - Keep one-off literals and one-method-only strings local to the method that owns them.
