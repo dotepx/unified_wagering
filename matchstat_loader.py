@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 import time
 from argparse import ArgumentParser, Namespace
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -47,10 +49,14 @@ FIXTURE_INCLUDE: Final[str] = (
     ",tournament.rank,tournament.country,h2h"
 )
 
-# included fields when fetching historical tournament results
-RESULTS_INCLUDE: Final[str] = "round"
+# included fields when fetching historical player match archives
+PAST_MATCH_INCLUDE: Final[str] = (
+    "round,tournament,tournament.court"
+    ",tournament.rank,tournament.country"
+)
 
 TOURNAMENT_CACHE_FILE: Final[str] = "tournament_info_cache.json"
+PLAYER_MATCH_CACHE_DIR: Final[str] = "matchstat_player_past_matches"
 
 # tiers excluded when include_futures is False
 _SKIP_TIERS: Final[frozenset[str]] = frozenset({"FUTURE", "FUTURES"})
@@ -72,14 +78,20 @@ _NONDIGIT_RE: re.Pattern = re.compile(r"[^\d.]")
 
 # fallback round-name mapping for when include=round is unavailable
 _ROUND_NAMES: Final[dict[int, str]] = {
-    1: "Q1", 2: "Q2", 3: "Q3",
-    4: "R128", 5: "R64", 6: "R32", 7: "R16",
-    8: "Quarterfinals", 9: "Semifinals", 10: "Final",
-    11: "3rd Place", 12: "Final",
+    0: "Qualifying",
+    1: "Final",
+    2: "Semi-Final",
+    3: "Quarter-Final",
+    4: "R16",
+    5: "R32",
+    6: "R64",
+    7: "R128",
+    16: "Round Robin",
 }
 
 # module-level rate-limit clock shared across all calls in this process
 _next_call_at: list[float] = [0.0]
+_rate_limit_lock: threading.Lock = threading.Lock()
 
 TournamentMeta = dict[str, Any]  # keys: site, surface, prize, draw_size
 TournamentCache = dict[str, TournamentMeta]  # key: "division/season_id"
@@ -98,6 +110,8 @@ class AppConfig(BaseAppConfig):
     start_year: int = 2007
     include_futures: bool = False
     tournament_info: bool = True
+    workers: int = 4
+    refresh_player_cache: bool = False
     timeout: tuple[float, float] = (5.0, 30.0)
     output_file: str = "tennis_all_matches.pqt"
 
@@ -107,7 +121,10 @@ class AppConfig(BaseAppConfig):
                 "missing matchstat api key; use --api_key, "
                 f"--api_key_file, or set {MATCHSTAT_API_KEY_ENV} env var"
             )
+        if self.workers < 1:
+            raise ValueError("workers must be at least 1")
         BaseAppConfig.__post_init__(self)
+        self.player_match_cache_dir.mkdir(parents=True, exist_ok=True)
 
     @property
     def output_path(self) -> Path:
@@ -119,6 +136,15 @@ class AppConfig(BaseAppConfig):
         """return the tournament metadata cache path"""
         return self.output_dir / TOURNAMENT_CACHE_FILE
 
+    @property
+    def player_match_cache_dir(self) -> Path:
+        """return the per-player historical match cache directory"""
+        return (
+            self.output_dir
+            / PLAYER_MATCH_CACHE_DIR
+            / f"start_{self.start_year}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # API layer
@@ -129,10 +155,11 @@ def _api_get(
     config: AppConfig, path: str, params: dict[str, Any]
 ) -> Any:
     """one rate-limited matchstat API call"""
-    wait = _next_call_at[0] - time.monotonic()
-    if wait > 0:
-        time.sleep(wait)
-    _next_call_at[0] = time.monotonic() + REQUEST_SPACING
+    with _rate_limit_lock:
+        wait = _next_call_at[0] - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _next_call_at[0] = time.monotonic() + REQUEST_SPACING
 
     return fetch_json_retries(
         JSONRequest(
@@ -147,25 +174,59 @@ def _api_get(
     )
 
 
-def _has_next_page(response: Any, fixtures: list[Any]) -> bool:
+def _has_next_page(response: Any, records: list[Any]) -> bool:
     """detect whether the API signals a next page"""
     if isinstance(response, dict) and "hasNextPage" in response:
         return bool(response["hasNextPage"])
-    last = fixtures[-1] if fixtures else None
+    if isinstance(response, list) and response:
+        last_response = response[-1]
+        if isinstance(last_response, dict) and "hasNextPage" in last_response:
+            return bool(last_response["hasNextPage"])
+    if isinstance(response, dict):
+        for val in response.values():
+            if isinstance(val, list) and val:
+                last_response = val[-1]
+                if (
+                    isinstance(last_response, dict)
+                    and "hasNextPage" in last_response
+                ):
+                    return bool(last_response["hasNextPage"])
+    last = records[-1] if records else None
     if isinstance(last, dict) and "hasNextPage" in last:
         return bool(last["hasNextPage"])
-    return len(fixtures) >= PAGE_SIZE
+    return len(records) >= PAGE_SIZE
+
+
+def _is_page_marker(record: dict[str, Any]) -> bool:
+    """return whether a dict is a pagination marker, not a data row"""
+    return "hasNextPage" in record and "id" not in record
+
+
+def _extract_records(
+    response: Any, keys: tuple[str, ...] = ("data",)
+) -> list[dict[str, Any]]:
+    """pull a record list from common matchstat response shapes"""
+    if isinstance(response, list):
+        return [
+            record
+            for record in response
+            if isinstance(record, dict) and not _is_page_marker(record)
+        ]
+    if isinstance(response, dict):
+        for key in keys:
+            if isinstance(response.get(key), list):
+                return [
+                    record
+                    for record in response[key]
+                    if isinstance(record, dict)
+                    and not _is_page_marker(record)
+                ]
+    return []
 
 
 def _extract_fixtures(response: Any) -> list[dict[str, Any]]:
     """pull the fixture list from whatever shape the response takes"""
-    if isinstance(response, list):
-        return [f for f in response if isinstance(f, dict)]
-    if isinstance(response, dict):
-        for key in ("data", "fixtures", "results"):
-            if isinstance(response.get(key), list):
-                return [f for f in response[key] if isinstance(f, dict)]
-    return []
+    return _extract_records(response, ("data", "fixtures", "results"))
 
 
 def fetch_all_pages(
@@ -349,7 +410,30 @@ def _parse_seed(raw: Any) -> float:
         return np.nan
 
 
-def _parse_result(result: str) -> dict[str, Any]:
+def _parse_numeric(raw: Any) -> float:
+    """parse provider numeric strings, returning nan when absent"""
+    if raw is None or str(raw).strip() == "":
+        return np.nan
+    try:
+        return float(_NONDIGIT_RE.sub("", str(raw)))
+    except ValueError:
+        return np.nan
+
+
+def _parse_best_of(raw: Any, rank_name: str, division: str) -> int:
+    """parse best-of, falling back to the tournament level rule"""
+    if raw is None or str(raw).strip() == "":
+        return _best_of(rank_name, division)
+    try:
+        return int(float(str(raw).strip()))
+    except ValueError:
+        return _best_of(rank_name, division)
+
+
+def _parse_result(
+    result: str,
+    winner_is_player1: bool = True,
+) -> dict[str, Any]:
     """parse score string into per-set scores and match comment"""
     row: dict[str, Any] = {
         f"FEATURE_WINNER_SET_{i}": np.nan for i in range(1, 6)
@@ -372,10 +456,15 @@ def _parse_result(result: str) -> dict[str, Any]:
 
     sets = _SET_RE.findall(result)
     w_wins = l_wins = 0
-    for i, (ws, ls) in enumerate(sets[:5], start=1):
-        row[f"FEATURE_WINNER_SET_{i}"] = int(ws)
-        row[f"FEATURE_LOSER_SET_{i}"] = int(ls)
-        if int(ws) > int(ls):
+    for i, (p1s, p2s) in enumerate(sets[:5], start=1):
+        winner_score, loser_score = (
+            (int(p1s), int(p2s))
+            if winner_is_player1
+            else (int(p2s), int(p1s))
+        )
+        row[f"FEATURE_WINNER_SET_{i}"] = winner_score
+        row[f"FEATURE_LOSER_SET_{i}"] = loser_score
+        if winner_score > loser_score:
             w_wins += 1
         else:
             l_wins += 1
@@ -411,7 +500,12 @@ def fixture_to_row(
     court_val, surface_val = _court_surface(raw_surface)
     rank_name: str = rank.get("name", "")
 
-    location: str = meta.get("site") or tournament.get("countryAcr", "")
+    country: dict = tournament.get("country") or {}
+    location: str = (
+        meta.get("site")
+        or str(country.get("name", "") or "").strip()
+        or tournament.get("countryAcr", "")
+    )
 
     # H2H is career-total and would leak future results into historical
     # training rows; only populate it for upcoming matches.
@@ -428,6 +522,12 @@ def fixture_to_row(
     row: dict[str, Any] = {
         "LABEL_DATE": (fixture.get("date") or "")[:10],
         "LABEL_SOURCE_FIXTURE_ID": fixture.get("id", ""),
+        "LABEL_SOURCE_TOURNAMENT_ID": fixture.get(
+            "tournamentId", tournament.get("id", "")
+        ),
+        "LABEL_SOURCE_ROUND_ID": fixture.get("roundId", ""),
+        "LABEL_SOURCE_PLAYER1_ID": fixture.get("player1Id", p1.get("id", "")),
+        "LABEL_SOURCE_PLAYER2_ID": fixture.get("player2Id", p2.get("id", "")),
         "LABEL_COMMENCE_TIME": (fixture.get("date") or ""),
         "SERIES_WINNER": _up(p1.get("name")),
         "SERIES_LOSER": _up(p2.get("name")),
@@ -479,108 +579,231 @@ def build_frame(
 
 
 # ---------------------------------------------------------------------------
-# Historical tournament results → row
+# Historical player past-matches -> row
 # ---------------------------------------------------------------------------
 
 
-def _is_main_tour(entry: dict[str, Any]) -> bool:
-    """return True for ATP/WTA main tour + challengers; exclude ITF futures"""
-    tier = str(entry.get("tier") or "").strip().upper()
-    rank_id = int(entry.get("rankId") or 0)
-    if any(skip in tier for skip in _SKIP_TIERS):
-        return False
-    return bool(tier) or rank_id > 0
+def _year_filter(config: AppConfig) -> str:
+    """return the API filter for the configured historical year range"""
+    this_year = date.today().year
+    years = ",".join(str(year) for year in range(config.start_year, this_year + 1))
+    return f"GameYear:{years}" if years else "GameYear:"
 
 
-def fetch_calendar(
+def _match_key(division: str, match: dict[str, Any]) -> str:
+    """return a stable key for deduping player history rows"""
+    source_id = match.get("id")
+    if source_id:
+        return f"{division}:{source_id}"
+    return (
+        f"{division}:{match.get('date')}:{match.get('player1Id')}:"
+        f"{match.get('player2Id')}:{match.get('tournamentId')}:"
+        f"{match.get('roundId')}:{match.get('result')}"
+    )
+
+
+def _included_history_match(
+    match: dict[str, Any],
+    include_futures: bool,
+) -> bool:
+    """return whether a historical match passes loader-level filters"""
+    if include_futures:
+        return True
+    tournament: dict = match.get("tournament") or {}
+    rank: dict = tournament.get("rank") or {}
+    tier = str(rank.get("name") or tournament.get("tier") or "").upper()
+    return not any(skip in tier for skip in _SKIP_TIERS)
+
+
+def fetch_players(
     config: AppConfig,
     division: str,
-    year: int,
 ) -> list[dict[str, Any]]:
-    """return all tournament season entries for one division and year"""
-    response = _api_get(
-        config,
-        f"{division}/tournament/calendar/{year}",
-        {},
-    )
-    if isinstance(response, list):
-        return [e for e in response if isinstance(e, dict)]
-    if isinstance(response, dict):
-        for key in ("data", "tournaments", "calendar"):
-            val = response.get(key)
-            if isinstance(val, list):
-                return [e for e in val if isinstance(e, dict)]
-    return []
+    """page through all singles players for one division"""
+    players: list[dict[str, Any]] = []
+    page_no = 1
+    while True:
+        response = _api_get(
+            config,
+            f"{division}/player",
+            {
+                "filter": "PlayerGroup:singles",
+                "pageSize": PAGE_SIZE,
+                "pageNo": page_no,
+            },
+        )
+        page_players = _extract_records(response)
+        if response is None:
+            update_status(f"null player response: {division} page {page_no}")
+            break
+        if page_no == 1 and not page_players:
+            update_status(f"unexpected player response: {str(response)[:300]}")
+        players.extend(page_players)
+        update_status(
+            f"{division} player p{page_no}: "
+            f"{len(page_players)} players (total: {len(players)})"
+        )
+        if not _has_next_page(response, page_players):
+            break
+        page_no += 1
+    return players
 
 
-def fetch_tournament_results(
+def fetch_player_past_matches(
     config: AppConfig,
     division: str,
-    season_id: int,
-) -> list[dict[str, Any]]:
-    """return singles match results for one tournament season"""
-    response = _api_get(
-        config,
-        f"{division}/tournament/results/{season_id}",
-        {"include": RESULTS_INCLUDE},
+    player_id: int,
+) -> list[dict[str, Any]] | None:
+    """page through one player's completed match archive"""
+    matches: list[dict[str, Any]] = []
+    page_no = 1
+    while True:
+        response = _api_get(
+            config,
+            f"{division}/player/past-matches/{player_id}",
+            {
+                "include": PAST_MATCH_INCLUDE,
+                "filter": _year_filter(config),
+                "pageSize": PAGE_SIZE,
+                "pageNo": page_no,
+            },
+        )
+        page_matches = _extract_records(response)
+        if response is None:
+            update_status(
+                f"null past-matches response: {division} player {player_id} "
+                f"page {page_no}"
+            )
+            return None
+        matches.extend(page_matches)
+        if not _has_next_page(response, page_matches):
+            break
+        page_no += 1
+    return matches
+
+
+def _player_cache_path(
+    config: AppConfig,
+    division: str,
+    player_id: int,
+) -> Path:
+    """return the per-player match cache path"""
+    division_dir = config.player_match_cache_dir / division
+    division_dir.mkdir(parents=True, exist_ok=True)
+    return division_dir / f"{player_id}.json"
+
+
+def _is_daily_cache_fresh(path: Path) -> bool:
+    """return whether a cache file was updated today"""
+    return path.exists() and date.fromtimestamp(path.stat().st_mtime) == date.today()
+
+
+def _load_player_match_cache(path: Path) -> list[dict[str, Any]] | None:
+    """load one per-player match cache"""
+    if not path.exists():
+        return None
+    try:
+        payload = load_json(str(path))
+    except Exception as ex:
+        update_status(f"player cache unreadable ({path.name}): {ex}")
+        return None
+    matches = payload.get("matches") if isinstance(payload, dict) else None
+    if isinstance(matches, list):
+        return [match for match in matches if isinstance(match, dict)]
+    update_status(f"player cache has unexpected shape: {path}")
+    return None
+
+
+def _save_player_match_cache(
+    path: Path,
+    division: str,
+    player_id: int,
+    config: AppConfig,
+    matches: list[dict[str, Any]],
+) -> None:
+    """save one player's raw past-match records"""
+    write_json(
+        str(path),
+        {
+            "division": division,
+            "player_id": player_id,
+            "start_year": config.start_year,
+            "fetched_date": date.today().isoformat(),
+            "matches": matches,
+        },
     )
-    if not isinstance(response, dict):
-        return []
-    data = response.get("data")
-    if isinstance(data, dict):
-        singles = data.get("singles") or []
-    elif isinstance(data, list):
-        singles = data
-    else:
-        singles = []
-    return [m for m in singles if isinstance(m, dict)]
+
+
+def load_or_fetch_player_past_matches(
+    config: AppConfig,
+    division: str,
+    player_id: int,
+) -> tuple[int, list[dict[str, Any]], bool, bool]:
+    """load today's player cache or refresh it from the API"""
+    cache_path = _player_cache_path(config, division, player_id)
+    if not config.refresh_player_cache and _is_daily_cache_fresh(cache_path):
+        cached_matches = _load_player_match_cache(cache_path)
+        if cached_matches is not None:
+            return player_id, cached_matches, True, True
+
+    fetched_matches = fetch_player_past_matches(config, division, player_id)
+    if fetched_matches is None:
+        stale_matches = _load_player_match_cache(cache_path)
+        if stale_matches is not None:
+            update_status(
+                f"using stale cache for {division} player {player_id}"
+            )
+            return player_id, stale_matches, True, True
+        return player_id, [], False, False
+
+    _save_player_match_cache(
+        cache_path, division, player_id, config, fetched_matches
+    )
+    return player_id, fetched_matches, False, True
 
 
 def result_to_row(
     match: dict[str, Any],
     division: str,
-    calendar_entry: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """convert a tournament results match to a grammar row; None if unknown winner"""
+    """convert one player past-match record to a grammar row"""
     p1: dict = match.get("player1") or {}
     p2: dict = match.get("player2") or {}
-    p1_id = match.get("player1Id")
-    p2_id = match.get("player2Id")
+    p1_id = match.get("player1Id") or p1.get("id")
+    p2_id = match.get("player2Id") or p2.get("id")
     winner_id = match.get("match_winner")
 
-    if winner_id is None:
-        return None
-    if winner_id == p1_id or winner_id == p1.get("id"):
-        winner, loser = p1, p2
-    elif winner_id == p2_id or winner_id == p2.get("id"):
+    if winner_id == p2_id:
         winner, loser = p2, p1
+        winner_source_id, loser_source_id = p2_id, p1_id
+    elif winner_id in (None, p1_id):
+        winner, loser = p1, p2
+        winner_source_id, loser_source_id = p1_id, p2_id
     else:
         return None
 
-    # prefer embedded round object (include=round); fall back to roundId map
     rnd: dict = match.get("round") or {}
     round_id = int(match.get("roundId") or 0)
     round_name = (
         rnd.get("name") or _ROUND_NAMES.get(round_id, f"Round_{round_id}")
     )
 
-    # tournament metadata comes directly from the calendar entry
-    court_obj: dict = calendar_entry.get("court") or {}
-    coutry: dict = (
-        calendar_entry.get("coutry") or calendar_entry.get("country") or {}
+    tournament: dict = match.get("tournament") or {}
+    court_obj: dict = tournament.get("court") or {}
+    country_obj: dict = (
+        tournament.get("country") or tournament.get("coutry") or {}
     )
-    tier = str(calendar_entry.get("tier") or "")
-    rank_name = tier
+    rank_obj: dict = tournament.get("rank") or {}
+    rank_name = str(rank_obj.get("name") or tournament.get("tier") or "")
 
     raw_surface = court_obj.get("name", "")
     court_val, surface_val = _court_surface(raw_surface)
-    location = str(coutry.get("name", "") or "").strip()
-
-    raw_draw = calendar_entry.get("draw_size")
-    try:
-        draw_size: float = float(str(raw_draw)) if raw_draw else np.nan
-    except ValueError:
-        draw_size = np.nan
+    location = (
+        country_obj.get("name")
+        or tournament.get("countryAcr")
+        or tournament.get("site")
+        or ""
+    )
 
     def _up(s: Any) -> str:
         return str(s or "").strip().upper()
@@ -588,6 +811,14 @@ def result_to_row(
     row: dict[str, Any] = {
         "LABEL_DATE": (match.get("date") or "")[:10],
         "LABEL_SOURCE_FIXTURE_ID": match.get("id", ""),
+        "LABEL_SOURCE_TOURNAMENT_ID": match.get(
+            "tournamentId", tournament.get("id", "")
+        ),
+        "LABEL_SOURCE_ROUND_ID": round_id,
+        "LABEL_SOURCE_PLAYER1_ID": p1_id or "",
+        "LABEL_SOURCE_PLAYER2_ID": p2_id or "",
+        "LABEL_SOURCE_WINNER_PLAYER_ID": winner_source_id or "",
+        "LABEL_SOURCE_LOSER_PLAYER_ID": loser_source_id or "",
         "LABEL_COMMENCE_TIME": (match.get("date") or ""),
         "SERIES_WINNER": _up(winner.get("name")),
         "SERIES_LOSER": _up(loser.get("name")),
@@ -599,20 +830,27 @@ def result_to_row(
         "FEATURE_P2_SEED": np.nan,
         "FEATURE_P1_H2H_WINS": np.nan,
         "FEATURE_P2_H2H_WINS": np.nan,
-        "FEATURE_DRAW_SIZE": draw_size,
-        "FEATURE_PRIZE_MONEY": np.nan,
+        "FEATURE_DRAW_SIZE": _parse_numeric(tournament.get("draw_size")),
+        "FEATURE_PRIZE_MONEY": _parse_numeric(tournament.get("prize")),
         "CATEGORY_LOCATION": _up(location),
-        "CATEGORY_TOURNAMENT": _up(calendar_entry.get("name")),
+        "CATEGORY_TOURNAMENT": _up(tournament.get("name")),
         "CATEGORY_COURT": _up(court_val),
         "CATEGORY_SURFACE": _up(surface_val),
         "CATEGORY_ROUND": _up(round_name),
-        "CATEGORY_SETS": _best_of(rank_name, division),
+        "CATEGORY_SETS": _parse_best_of(
+            match.get("best_of"), rank_name, division
+        ),
         "CATEGORY_SERIES": _up(rank_name),
         "CATEGORY_MATCH_DIVISION": division.upper(),
         "CATEGORY_P1_COUNTRY": _up(winner.get("countryAcr")),
         "CATEGORY_P2_COUNTRY": _up(loser.get("countryAcr")),
     }
-    row.update(_parse_result(match.get("result", "")))
+    row.update(
+        _parse_result(
+            match.get("result", ""),
+            winner_is_player1=winner_source_id == p1_id,
+        )
+    )
     return row
 
 
@@ -620,58 +858,71 @@ def build_hist_frame(
     matches: list[dict[str, Any]],
     division: str,
 ) -> pd.DataFrame:
-    """convert tournament results matches to a DataFrame"""
-    rows = []
-    for match in matches:
-        calendar_entry = match.get("_calendar_entry") or {}
-        row = result_to_row(match, division, calendar_entry)
-        if row is not None:
-            rows.append(row)
+    """convert player past-match records to a DataFrame"""
+    rows = [
+        row
+        for match in matches
+        if (row := result_to_row(match, division)) is not None
+    ]
     return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-
-# ---------------------------------------------------------------------------
-# Fetch orchestration
-# ---------------------------------------------------------------------------
 
 
 def fetch_historical(
     config: AppConfig,
 ) -> dict[str, list[dict[str, Any]]]:
-    """fetch completed matches via calendar + tournament/results"""
-    today = date.today()
+    """fetch completed matches via every player's past-matches archive"""
     by_division: dict[str, list[dict[str, Any]]] = {d: [] for d in DIVISIONS}
 
-    for year in range(config.start_year, today.year + 1):
-        for division in DIVISIONS:
-            update_status(f"fetching {division} calendar {year}")
-            calendar = fetch_calendar(config, division, year)
-
-            tournaments = (
-                [e for e in calendar if _is_main_tour(e)]
-                if not config.include_futures
-                else calendar
-            )
-            update_status(
-                f"{division} {year}: {len(tournaments)} tournaments "
-                f"(of {len(calendar)} total)"
-            )
-
-            for entry in tournaments:
-                season_id = entry.get("id")
-                if not season_id:
-                    continue
-                results = fetch_tournament_results(
-                    config, division, int(season_id)
-                )
-                if results:
+    for division in DIVISIONS:
+        players = fetch_players(config, division)
+        player_ids = [
+            int(player["id"])
+            for player in players
+            if player.get("id")
+        ]
+        update_status(
+            f"fetching {division} past matches for {len(player_ids)} players "
+            f"with {config.workers} workers"
+        )
+        match_by_key: dict[str, dict[str, Any]] = {}
+        cache_hits = 0
+        failures = 0
+        with ThreadPoolExecutor(max_workers=config.workers) as executor:
+            future_map = {
+                executor.submit(
+                    load_or_fetch_player_past_matches,
+                    config,
+                    division,
+                    player_id,
+                ): player_id
+                for player_id in player_ids
+            }
+            for idx, future in enumerate(as_completed(future_map), start=1):
+                player_id = future_map[future]
+                try:
+                    _, matches, from_cache, success = future.result()
+                except Exception as ex:
+                    failures += 1
                     update_status(
-                        f"  {division} {entry.get('name', season_id)}: "
-                        f"{len(results)} results"
+                        f"{division} player {player_id} failed: {ex}"
                     )
-                    for match in results:
-                        match["_calendar_entry"] = entry
-                    by_division[division].extend(results)
+                    continue
+                cache_hits += int(from_cache)
+                failures += int(not success)
+                kept_matches = [
+                    match
+                    for match in matches
+                    if _included_history_match(match, config.include_futures)
+                ]
+                for match in kept_matches:
+                    match_by_key.setdefault(_match_key(division, match), match)
+                if idx == 1 or idx % 25 == 0 or idx == len(player_ids):
+                    update_status(
+                        f"{division} players {idx}/{len(player_ids)}: "
+                        f"{len(match_by_key)} unique matches, "
+                        f"{cache_hits} cache hits, {failures} misses"
+                    )
+        by_division[division] = list(match_by_key.values())
 
     return by_division
 
@@ -722,6 +973,17 @@ def parse_arguments() -> Namespace:
         help="skip prize/draw_size tournament info calls for upcoming",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="parallel player-history workers (default 4)",
+    )
+    parser.add_argument(
+        "--refresh_player_cache",
+        action="store_true",
+        help="force refresh of per-player past-match cache files",
+    )
+    parser.add_argument(
         "--output_file",
         default="tennis_all_matches.pqt",
         help="output parquet filename",
@@ -742,6 +1004,8 @@ def build_app_config(args: Namespace) -> AppConfig:
         start_year=args.start_year,
         include_futures=args.include_futures,
         tournament_info=not args.no_tournament_info,
+        workers=args.workers,
+        refresh_player_cache=args.refresh_player_cache,
         output_file=args.output_file,
     )
 
